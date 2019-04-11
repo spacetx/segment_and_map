@@ -1,0 +1,328 @@
+---
+title: "Segmenting spatial transcriptomics data"
+output: html_notebook
+---
+  
+This code assigns cell ids to each spot from a spatial transcriptomics data set.  More specifically, it reads in all spot data in the [starfish](https://spacetx-starfish.readthedocs.io/en/latest/) `IntensityTable` format (each row is a spot, columns are locations and gene IDs), performs a modified watershed segmentation on all of the spot locations to assign each spot to a cell, and then appends a cell id column to the `IntensityTable`.  It also compiles an intensity matrix (cell x gene matrix with each value corresponding to spots per cell) and a meta-data matrix (e.g., spot location and area) for use with the `mfishtools` r library or other mapping (or clustering) strategies.  In this case the example data is and smFISH experiment from the Allen Institute.  
+  
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+  
+  
+### Set up workspace and read in data
+  
+First, navigate to the correct working directory (e.g., `setwd("//allen/programs/celltypes/workgroups/hct/HCT_RNAseq/Jeremy/spacetx_analysis/segmentation/")`).  
+  
+Next, install the necessary packages.  In this case we are using data from `tasic2016data` and plotting functions from `scrattch.vis`.
+  
+```{r install packages, eval=FALSE}
+install.packages("fields")
+install.packages("imager")
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("EBImage", version = "3.8")
+```
+  
+  
+Load libraries.  
+  
+```{r load libraries}
+suppressPackageStartupMessages({
+  library(fields)    # For conversion to image
+  library(imager)    # For image smoothing
+  library(EBImage)   # For segmentation
+  library(jpeg)      # For reading and writing jpegs
+})
+options(stringsAsFactors = FALSE)  # IMPORTANT
+print("Libraries loaded.")
+```
+  
+Include additional functions.  First, `as.image2` is a modified version of the function `as.image` from the `fields` library where the **summed** values in each pixel location are returned instead of the average value.  Second, `get.image.matrix` is a wrapper for `as.image2` that scales the resulting image from 0 to 1 and sets all locations with no spots to 0.  
+  
+```{r required functions}
+as.image2 <- function (Z, ind = NULL, grid = NULL, x = NULL, weights = rep(1, 
+    length(Z)), na.rm = FALSE, nx = 64, ny = 64, boundary.grid = FALSE, 
+    nrow = NULL, ncol = NULL, FUN = NULL) 
+{ 
+    # Update of as.image to sum rather than average values
+    Z <- c(Z)
+    if (!is.null(ind)) {
+        x <- ind
+    }
+    if (!is.null(nrow) & !is.null(ncol)) {
+        nx <- nrow
+        ny <- ncol
+    }
+    if (any(is.na(weights)) | any(is.na(c(x)))) {
+        stop("missing values in weights or x")
+    }
+    temp <- discretize.image(x, m = nx, n = ny, grid = grid, 
+        boundary.grid = boundary.grid)
+    grid <- temp$grid
+    w <- z <- matrix(NA, nrow = temp$m, ncol = temp$n)
+    tempw <- tapply(weights, temp$index, sum, na.rm = na.rm)
+    if (is.null(FUN)) {
+        tempz <- tapply(Z * weights, temp$index, sum, na.rm = na.rm)
+        #tempz <- tempz/tempw  # We want the sum
+    }
+    else {
+        tempz <- tapply(Z, temp$index, FUN)
+    }
+    z[temp$ix, temp$iy] <- tempz
+    w[temp$ix, temp$iy] <- tempw
+    call <- match.call()
+    list(x = grid$x, y = grid$y, z = z, call = call, ind = cbind(temp$index[[1]], 
+        temp$index[[2]]), weights = w, xd = cbind(grid$x[temp$index[[1]]], 
+        grid$y[temp$index[[2]]]), call = match.call(), FUN = FUN)
+}
+
+get.image.matrix <- function(dat, maxVal=8, nx=1500, ny=nx, x="xc", y="yc", ...) {
+  rawImage <- as.image2(rep(1,dim(dat)[1]),x=as.matrix(dat[,c(x,y)]),nx=nx,ny=ny,...)
+  rawImage$z[is.na(rawImage$z)] = min(rawImage$z,na.rm=TRUE)
+  rawImage$z[rawImage$z>maxVal] = maxVal
+  rawImage$z = rawImage$z-min(rawImage$z)
+  rawImage$z = rawImage$z/max(rawImage$z)
+  rawImage
+}
+```
+  
+  
+Read in the smFISH data.  In this case this is a section of mouse primary visual cortex (VISp) run at the Allen Institute.    
+
+```{r read in mfish data}
+fileIn    <- "smFISH_MCT_CZI_Panel_0_spot_table.csv"
+imageData <- read.csv(fileIn)
+```
+  
+  
+### Cell segmentation 
+  
+First, we need to convert our vector of spot locations (stored in the `xc` and `yc` columns of `imageData`) into a 2d matrix of spot counts.  In this case we found that a 1500 x 1500 pixel matrix seemed to work well, but this parameter may need to be adjusted for different experiments.
+  
+```{r convert to image, fig.height=12, fig.width=13}
+# Set parameters
+nx     <- 1500  # width of image in pixels
+ny     <- 1500  # height of image in pixels
+maxVal <- 8     # threshold for maximum value
+
+# Conversion
+rawImage <- get.image.matrix(imageData,maxVal,nx,ny,x="xc",y="yc")
+
+# Plot the raw image
+image.plot(rawImage$z)
+```  
+  
+  
+Next, we smooth the image.  Watershed is very sensitive to missing pixels within cells (as well as stray spots between cells) and this step helps to address this issue.  There are several methods for image smoothing in all three of the loaded libraries, but in this cases the `isoblur` function worked best.
+  
+```{r smooth the image, fig.height=12, fig.width=13}
+# Set parameters
+sigma <- 1  # This is a measure of how much blurring (higher is more)
+
+# Smooth the image
+smoothImage <- isoblur(rawImage$z %>% as.cimg, sigma)[,,1,1]
+
+# Plot the smoothed image
+image.plot(smoothImage)
+``` 
+  
+  
+Output the results to jpeg, which is required input format for the segmentation algorithm.  
+  
+```{r output to jpeg}
+# Set parameters
+prefix <- "smFISH"  # File name prefix for all outputted files
+fn     <- paste0(prefix,"_smooth.jpg")
+
+# Save image
+writeJPEG(smoothImage,fn,quality=1)
+```  
+  
+  
+Next, we will use the watershed algorithm to segment cells, which is described [here](https://www.mathworks.com/help/images/marker-controlled-watershed-segmentation.html;jsessionid=fae7dfdd91e82acc965f8b22f86d) as a transform that "finds 'catchment basins' and 'watershed ridge lines' in an image by treating it as a surface where light pixels are high and dark pixels are low."   
+  
+To do this, we first need to read in the image we just wrote out, and then apply a filtering algorithm to assign each pixel as either foreground or background.  
+  
+```{r foreground vs background assignment}
+# Read in the image
+nuc <- readImage(fn)
+
+# Foreground/background assignment
+disc   <- makeBrush(31, "disc")
+disc   <- disc / sum(disc)
+offset <- 0.05
+nuc_bg <- filter2( nuc, disc )
+nuc_th <- nuc > nuc_bg + offset
+``` 
+  
+  
+Now run the actual segmentation.  Note that there is a watershed function in both the `imager` and the `EBImage` library, so we need to specify which version we want to run.  
+  
+```{r watershed segmentation}
+# Watershed segmentation
+nmask  <- EBImage::watershed( distmap(nuc_th), tolerance=2, ext=3 )
+``` 
+  
+  
+The watershed algorithm looks for **all** catchment basins in the image, whether or not they are the correct size and shape of real cell somas.  As a quick strategy for eliminating spots that are obviously extra-soma signal (and therefore not of interest), we exclude all spots that are too small (as defined manually).  As implemented, this is reasonably conservative (e.g., we still have some non-cells) and will fail to identify any doublets (e.g., adjacent cell bodies defined by the watershed algorithm as a single cell).  
+  
+```{r threshold the image to removed debris}
+# Set paramters
+minSize   <- 45   
+
+# Threshold the image
+thMask    <- nmask
+okVals    <- as.numeric(names(table(thMask))[table(thMask)>=minSize])
+thMask[!is.element(nmask,okVals)] = 0
+fillMask  <- fillHull(thMask)
+``` 
+  
+  
+Finally, let's ouput the results to see how it looks.
+  
+```{r plot the segmented image, fig.height=12, fig.width=13}
+fn2 <- gsub("smooth","colormap",fn)
+writeJPEG(colorLabels(fillMask), fn2, quality=1)
+plot(colorLabels(t(fillMask[nx:1,])))  # Need to transpose and reflect the image for plot to work properly
+``` 
+  
+These results look quite promising!  
+  
+  
+### Assign cell IDs to each spot
+  
+Now that we have defined the cells, we need to undo our vector-to-image transformation and assign the correct cell ID for each spot.  Fortunately, the location of each spot in the image was stored in the `rawImage` variable when running `get.image.matrix` above.  
+  
+```{r assign cell number to each spot}
+## Assign cell numbers
+finalMask <- t(imageData(fillMask))
+cellNumber <- apply(rawImage$ind,1,function(x,y) y[x[1],x[2]], finalMask)
+imageData$cellNumber = cellNumber
+
+## Output the updated results
+fileOut <- gsub(".csv","_plusCell.csv",fileIn)
+write.csv(imageData,fileOut)
+```  
+  
+  
+Let's see how things look overall.  How many cells do we have, and how many spots are included in the cell calls?
+  
+```{r how many spots and cells}
+# How many cells?
+length(table(finalMask))
+
+# How many assigned spots?
+mean(cellNumber>0)
+``` 
+  
+Overall we have >1700 cells and are using ~70% of the spots.  How do the final images look of the "good" vs. "bad" spots?  
+  
+```{r plot the good and bad cells, fig.height=12, fig.width=13}
+# Image of "good" cells
+onImage  <- get.image.matrix(imageData[cellNumber>0,],maxVal,nx,ny)
+image.plot(onImage$z)
+
+# Image of "bad" cells
+offImage <- get.image.matrix(imageData[cellNumber==0,],maxVal,nx,ny)
+image.plot(offImage$z)
+``` 
+  
+Overall, the filter of good vs. bad spots seems to be quite effective.  
+  
+  
+### Save information by cell for mapping to RNA-seq  
+  
+Thus far all spots have been treated independently; however, there are several key pieces of information in each spot that need to be tabulated across cells (since the unit of measure we actually care about is cells, and not spots).  This section of the code summarizes the spot information by cell and outputs a table consistent with `starfish` output.  The outout is in the form of two files.  
+  
+First, is the gene expression matrix, where rows are genes and columns are cells and values are counts.  Let's generate that here.  
+  
+```{r generate expression matrix}
+# variable set-up
+genes    <- sort(unique(imageData$target))
+cells    <- setdiff(sort(unique(imageData$cellNumber)),0)
+geneData <- factor(imageData$target,levels=genes)
+cellData <- imageData$cellNumber
+fishData <- NULL
+
+# Calculate the matrix on a cell by cell basis
+for (c in cells)
+  fishData <- cbind(fishData,table(geneData[cellData==c]))
+colnames(fishData) <- cells
+rownames(fishData) <- genes
+```
+  
+  
+Second is the cell meta-data file, where each row is a cell, and at least the following columns are included (and other column names are perfectly fine):  
+ - area       = Area/volume of the cell (or just set to a constant)  
+ - experiment = Name of the experiment or experiments (or just set ot a constant)  
+ - layerData  = Numeric call for the layer.  Not requred, but useful for plotting an rotating x, y  
+ - x          = X coordinate for cell (ideally this is the lateral coordinate)  
+ - y          = Y coordinate for cell (ideally this is the laminar coordinate)
+ - z          = [optional] Z coordinate for cell (this is estimated and is often not useful)  
+Let's generate that here.  
+
+```{r generate meta-data}
+# variable set-up
+scale    <- 1000  # This is to convert the data from meters to millimeters, and may need to be adjusted
+metadata <- NULL
+zData    <- imageData$zc*scale
+spotSize <- diff(rawImage$x[2:1])*diff(rawImage$y[2:1])*scale*scale
+
+# Calculate the meta-data matrix
+for (c in cells){
+  yxTmp <- which(finalMask==c,arr.ind = TRUE)
+  z     <- mean(zData[cells==c])              # Estimate the z centroid
+  x     <- mean(rawImage$x[yxTmp[,2]])*scale  # x centroid 
+  y     <- mean(rawImage$y[yxTmp[,1]])*scale  # y centroid
+  area  <- dim(yxTmp)[1]*spotSize
+  metadata <- rbind(metadata,c(paste0("Cell_",c),x,y,z,area))
+}
+metadata <- as.data.frame(metadata)
+colnames(metadata)  <- c("cellID","x","y","z","area")
+metadata$layerData  <- 0              # Currently we don't have a layer call
+metadata$experiment <- "MouseVISp_AI" # Any name is fine
+
+print(paste("Approximate average diameter of cells, in um:",round(sqrt((mean(metaData$area)*1000000)/pi)*2)))
+```
+  
+This is roughly reasonable if we assume that each cell represents the entire nucleus and a subset of the soma (and that there are still some errors in the algorithm).  Now let's see how expression of all genes looks (we will output the results to a file).  
+  
+```{r plot gene counts, fig.height=7,fig.width=7}
+pdf(paste0(prefix,"_genePlots.pdf"))
+for (g in genes){
+ val <- gray.colors(100,0,1)[100-round(99*fishData[g,]/max(fishData[g,]))]
+ plot(metadata$y,metadata$x,pch=19,xlab="y (mm)",ylab="x (mm)",col=val,main=g)
+}
+dev.off()
+
+# Also output the last one to the screen
+plot(metadata$y,metadata$x,pch=19,xlab="y (mm)",ylab="x (mm)",col=val,main=g)
+```
+  
+These plots look great!  
+  
+Finally, let's save these results to files.  
+  
+```{r save expression data and meta-data}
+write.csv(fishData, paste0(prefix,"_expressionMatrix.csv"))
+write.csv(metaData, paste0(prefix,"_metaData.csv"),row.names=FALSE)
+```
+  
+  
+NOTE: Be sure to appropriately cite the original authors as needed if using this algorithm.  
+  
+```{r library citations}
+citation("fields")    # For conversion to image
+citation("imager")    # For image smoothing
+citation("EBImage")   # For segmentation
+citation("jpeg")      # For reading and writing jpegs
+```
+  
+  
+Output session information.  
+  
+```{r sessionInfo}
+sessionInfo()
+```

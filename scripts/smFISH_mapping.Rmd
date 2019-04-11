@@ -1,0 +1,442 @@
+---
+title: "Mapping mFISH data to reference data set"
+output: html_notebook
+---
+  
+This code reads in all of the data for a spatial transcriptomics experiment (in this case a 22 gene panel run on mouse VISp tissue using smFISH at the Allen Institute) and compares it against a reference FACs data set.  As a starting point, we will use the ~49 cell types from the Tasic 2016 paper as an example, but this will be redone using the SpaceTx-derived mouse VISp reference at a later time.      
+  
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+  
+  
+### Workspace set-up
+  
+Install the necessary packages.  
+  
+```{r install packages, eval=FALSE}
+install.packages("devtools")
+devtools::install_github("AllenInstitute/mfishtools")    # For the mfishtools functions
+devtools::install_github("AllenInstitute/scrattch.vis")  # For plotting
+```
+  
+  
+Load libraries.  
+  
+```{r load libraries}
+suppressPackageStartupMessages({
+  library(mfishtools)    # This library!
+  library(matrixStats)   # For rowMedians function, which is fast
+  library(gplots)        # For some of the plots
+  library(scrattch.vis)  # For others of the plots
+  library(edgeR)         # For the cpm / rpkm function
+})
+options(stringsAsFactors = FALSE)  # IMPORTANT
+print("Libraries loaded.")
+```
+  
+  
+Read in the reference data, which is the VISp data and associated consensus clustering as defined as part ot the spacetx consortium.  All the data is downloaded from here (https://www.dropbox.com/sh/q687ajyvnkbtwkc/AACxlJAsJaJ5DVe-2mx3cbW2a?dl=0) and saved to the "reference_data" subdirectory.  Likewise the mouse gene lengths are downloaded from here (https://spacetx.slack.com/files/U87DJTK3J/F9VC4FCE7/mouse_gene_lengths.csv) (you need to sign into slack to get it).  **IMPORTANT NOTE: these cluster calls are an old version of the Allen Institute reference calls and NOT the class that came out of working group 2.**.
+  
+Now we need to read the data into R. **This step is slow.**  
+  
+```{r read in VISp data}
+exons      <- read.csv("reference_data/exon.counts.csv",row.names=1)
+introns    <- read.csv("reference_data/intron.counts.csv",row.names=1)
+geneInfo   <- read.csv("reference_data/mouse_gene_lengths.csv")
+sampInfo   <- read.csv("reference_data/samp.dat.csv",row.names=1)
+clInfo     <- read.csv("reference_data/cl.csv",row.names=1)
+clusterInfo<- read.csv("reference_data/cl.df.short.csv")
+```
+  
+We want to merge the cluster info in with the sample info.  Additional formatting of these data is done below.  
+  
+```{r format VISp metadata}
+sampInfo[is.na(sampInfo)] <- 0
+clInfo      <- clInfo[match(rownames(sampInfo),rownames(clInfo)),]
+annotations <- clusterInfo[match(clInfo,clusterInfo$cluster_id),]
+annotations <- cbind(annotations,sampInfo)
+annotations$sample_name <- annotations$sample_id <- colnames(exons) <- colnames(introns) <- rownames(sampInfo)
+rownames(geneInfo)    <- rownames(exons)
+```
+  
+  
+Read in the smFISH data.  We will use the data generated in the `smFISH_segmentation` script run previously.  In this case, `fishData` is a matrix of gene expression levels (e.g., spot counts within a cell) for a given cell, with genes as rows and cells as columns.  This is the same format as the RNA-seq data.  
+
+```{r what is mfish data}
+prefix   <- "smFISH"  # File name prefix for all inputted and outputted files
+fishData <- as.matrix(read.csv(paste0(prefix,"_expressionMatrix.csv"),row.names=1))
+dim(fishData)
+```
+  
+  
+The `metadata` variable is a data frame with some specific requirements on column names.  
+  
+```{r what is mfish metadata}
+metadata <- read.csv(paste0(prefix,"_metaData.csv"))
+colnames(metadata)
+```
+
+The required column names are as follows (and other column names are perfectly fine):  
+ - area       = Area/volume of the cell (or just set to a constant)  
+ - experiment = Name of the experiment or experiments (or just set ot a constant)  
+ - layerData  = Numeric call for the layer.  Not requred, but useful for plotting an rotating x, y  
+ - x          = X coordinate for cell (ideally this is the lateral coordinate)  
+ - y          = Y coordinate for cell (ideally this is the laminar coordinate)  
+  
+  
+### Data preparations
+  
+This analysis will be looking at marker genes for nearly all VISp cell types.  Specifically, we will omit all of the ALM excitatory types and will merge the types identified as _1, _2, _3 into _1
+  
+```{r define variables}
+cl        <- annotations$cluster_label
+for (i in 2:4)
+  cl <- gsub(paste0("_",i),"_1",cl)
+kpSamp    <- !grepl("ALM",cl)&(sampInfo$Region=="VISp")
+anno      <- annotations[kpSamp,]
+names(cl) <- annotations$sample_id
+kpClust   <- intersect(clusterInfo$cluster_label,cl[kpSamp])
+```
+  
+  
+Convert the RNA-seq data into RPKM(exons) and format appropriately.  NOTE: we often use counts per million of introns + exons when performing this analysis.  Currently, we don't know which method produces more reliable markers.  Alternative code for calculating cpm is commented out below. We also want to convert the data to log2(rpkm).
+  
+```{r format VISp data}
+## Calculate RPKM or CPM
+dat <- rpkm(introns[,kpSamp]+exons[,kpSamp],geneInfo$length)   # For RPKM
+#dat <- cpm(introns[,kpSamp]+exons[,kpSamp]) # For CPM
+
+## Convert to log2
+normDat = log2(dat+1)
+rownames(normDat) <- rownames(geneInfo)
+colnames(normDat) <- anno$sample_id
+
+print("Data normalized!")
+```
+  
+  
+Calculate proportions, means, and medians.  These are all used later for various reasons.  **One important thing to note** is that we are using `cl` here as a vector of cell type calls for the RNA-seq data (with names corresponding to the column/sample names of the RNA-seq sample data); however, if you wanted to map to a more coarse definition of cell types, or to omit certain cell types, this would be the step to do it.  The columns of these summary values calculated here define the cell types that mFISH data will be mapped against for the remainder of the vignette.   
+```{r calculate reference stats}
+# Calculate statistics
+exprThresh <- 1
+cl2        <- cl[kpSamp]
+medianExpr <- do.call("cbind", tapply(names(cl2), cl2, function(x) rowMedians(normDat[,x]))) 
+meanExpr   <- do.call("cbind", tapply(names(cl2), cl2, function(x) rowMeans(normDat[,x]))) 
+propExpr   <- do.call("cbind", tapply(names(cl2), cl2, function(x) rowMeans(normDat[,x]>exprThresh))) 
+rownames(medianExpr) <- rownames(propExpr) <- rownames(meanExpr) <- genes <- rownames(normDat)  
+print("Summary values calculated!")
+
+# Subset to only include relevant clusters
+medianExpr <- medianExpr[,kpClust]
+meanExpr   <- meanExpr[,kpClust]
+propExpr   <- propExpr[,kpClust]
+```
+  
+  
+Consider only genes included in the mFISH experiment that are also present in the RNA-seq reference data set (usually this is all of them).  
+  
+```{r format mFISH data}
+useGenes <- intersect(rownames(fishData),genes)  # Define genes to be used in the analysis
+fishDat  <- fishData[useGenes,]                  # Subset relevant smFISH genes
+print("mFISH data is ready!")
+```
+  
+  
+Temporary code to scale the RNA-seq data so that the max median value is 1.  This needs to be built into the mapping function.  
+  
+```{r scale RNA-seq data}
+medianExprMax <- t(apply(medianExpr[useGenes,],1,function(x) x/max(x)))
+maxFISH <- log2(apply(fishDat,1,quantile,1))
+for (g in rownames(medianExprMax))
+  medianExprMax[g,] <- medianExprMax[g,]*maxFISH[g]
+```
+  
+None of the scaling strategies I have tried work particularly well.  
+  
+  
+## Map the mFISH data!  
+  
+Do the mapping using the parameters defined below.  **Currently these are all manually selected and a bit of a guess.  I am open to suggestions for how to do this mapping in a more systematic way.**  The idea behind this method is to attach various filtering and scaling strategies to the mFISH and RNA-seq data sets, and then use correlation-based mapping to find the best fitting cell cluster.  My expectation (still to be tested) is that this strategy will be useful for smaller gene panels, but that other more computational-based strategies will be most effective for larger gene panels.  
+  
+```{r map mFISH data, warning=FALSE}
+# Parameters
+qprob    <- 0.9     # Parameter for scaling mFISH to FACS
+thresh   <- 5       # Set counts less than or equal to thresh to 0          1
+log2p1   <- function(x) return(log2(x+1))  # log transform function
+binarize <- FALSE   # Should the data be binarized?
+weights  <- NULL    # Integer weights.  SET TO NULL IF YOU DON'T KNOW WHAT YOU ARE DOING!
+#weights  <- round(rowSums(fishDat)/min(rowSums(fishDat)))  # Here is how to weight roughly by average expression level
+
+# Mapping
+fishMouse <- fishScaleAndMap(mapDat=fishDat, refSummaryDat=medianExprMax, 
+  mappingFunction = cellToClusterMapping_byCor, transform = log2p1, noiselevel = thresh, 
+  genesToMap = useGenes, metadata = metadata, qprob=qprob, binarize=binarize,
+  omitGenes = NULL,integerWeights=weights)
+print("Data is mapped.")
+```  
+  
+  
+Add cluster colors and cluster ids from RNA-seq reference data to data set for use later.  
+
+```{r update cluster colors}
+fishMouse$mappingResults$sample_name <- colnames(fishDat)
+fishMouse$mappingResults$Class_label <- fishMouse$mappingResults$Class
+fishMouse$mappingResults$Class_id    <- annotations$cluster_id[match(fishMouse$mappingResults$Class_label,annotations$cluster_label)]
+fishMouse$mappingResults$Class_color <- annotations$cluster_color[match(fishMouse$mappingResults$Class_label,annotations$cluster_label)]
+```
+
+  
+#### View the mapping results
+  
+First rotate the X and Y coordinate space to that layer 2 is parallel to the X axis.  This won't be perfect since the tissue is not perfectly linear, but it will make for easier viewing of the data.  This requires some meta-data variable which marks a subset of genes roughly along align (e.g., cortical layer calls).  **In this case, we don't have layer calls, but we will use high expression of Cux2 as a proxy for layer 2/3.**  
+  
+```{r rotateXY, fig.width=6, fig.height=6}  
+isL2       <- fishDat["Cux2",]>=20           ## Manually selected
+plot(metadata$y,metadata$x,pch=19,xlab="y (mm)",ylab="x (mm)",col=c("grey","green")[isL2+1],main="Cux2 thresholding")
+
+rotateAxis <- isL2 # fishMouse$metadata$layerData==4
+flipVector <- 4-isL2*2 #fishMouse$metadata$layerData
+for (e in unique(fishMouse$metadata$experiment)){
+  subset    <- fishMouse$metadata$experiment==e
+  fishMouse <- rotateXY(fishMouse,rotateAxis,flipVector,subset)
+}
+```
+  
+  
+Now plot the location of all of the cells in the tissue section, color-coded by cluster assignment.  
+  
+```{r plot cell locations, fig.width=8, fig.height=8}  
+plot(fishMouse$scaledX,-fishMouse$scaledY,pch=19,xlab="x (rotated, mm)",ylab="y (rotated, mm)",  
+    col=fishMouse$mappingResults$Class_color,main="Mouse VISp (AI)")   # Note the -y. I need to fix this
+```  
+  
+The rotation looks reasonable, and there is definite structure in the cluster assignments!  Let's break this out and show the cell distribution across each type in the tissue.   
+  
+```{r plot mFISH distributions,fig.width=20,fig.height=40}  
+allClusts  <- colnames(medianExpr)
+sc  <- function(n,...)  return(c("brown","pink","orange","turquoise","blue","green")[1:n])  # Standard colors without yellow
+lay <- rep(5,length(flipVector)) #as.character(fishMouse$metadata$layerData)  # NOTE: these are not correct layer assignments
+
+plotDistributions(fishMouse,group = "Class", groups = allClusts, colors = lay, pch=19, xlab="Mouse", 
+                  ylab="Layer",colormap=sc,maxrow=7)
+```  
+  
+Clusters seem to fall in one of three categories.  First, several clusters look reasonable based on their laminar distribution.  Second, several clusters seem to be catch-alls for many cells and are likely incorrect.  Third, several clusters have few (if any cells).  Some of these are likely correct and some are likely wrong.  
+  
+Now let's plot the heatmap to see how the data looks when clustered along the tree like this.  First, unscaled data, capped at 10 counts.  
+  
+```{r Plot mFISH heatmap (unscaled), fig.width=12,fig.height=8} 
+
+# Formatting for scrattch.vis functions
+cap       <- 25
+fish_df   <- cbind(sample_name = colnames(fishDat), as.data.frame(t(pmin(fishDat,cap))))
+fish_anno <- as.data.frame(fishMouse$mappingResults)
+
+## Fire plot (NOTE: OTHER PLOT OPTIONS ARE ALSO AVAILABLE)
+sample_fire_plot(fish_df, 
+                 fish_anno, 
+                 genes = rownames(fishDat), 
+                 grouping = "Class", 
+                 group_order = sort(unique(fish_anno$Class_id)),
+                 log_scale = FALSE,
+                 font_size = 7)
+
+## Code for heatmap plot, which is deprecated
+#colorset = c("darkblue", "dodgerblue", "gray80", "orange", "orangered")
+#heat_colors <- colorRampPalette(colorset)(1001)
+#plotHeatmap(fishMouse,main="Mouse cells (unscaled, cap=10)",group="Class",groups=allClusts,capValue=cap,
+#                             colormap=heat_colors,rowsep=NULL,dendrogram="row",Rowv = TRUE,margins = c(8,6))
+```
+  
+Next, let's plot the scaled heatmaps for comparison.  This is the data that is used in the mapping.  
+  
+```{r Plot mFISH heatmap (scaled), fig.width=12,fig.height=8} 
+
+# Formatting for scrattch.vis functions
+fish_df   <- cbind(sample_name = colnames(fishDat), as.data.frame(t(fishMouse$scaleDat)))
+
+## Fire plot (NOTE: OTHER PLOT OPTIONS ARE ALSO AVAILABLE)
+sample_fire_plot(fish_df, 
+                 fish_anno, 
+                 genes = rownames(fishDat), 
+                 grouping = "Class", 
+                 group_order = sort(unique(fish_anno$Class_id)),
+                 log_scale = FALSE,
+                 font_size = 7)
+
+## Code for heatmap plot, which is deprecated
+#plotHeatmap(fishMouse,main="Mouse cells (scaled, cap=8)",group="Class",groups=allClusts,capValue=cap,colormap=heat_colors,
+#                             rowsep=NULL,dendrogram="row",Rowv = TRUE,margins = c(8,6),useScaled=TRUE)  
+```
+  
+A few genes have quite low expression and probably should be omitted from future experiments.  Otherwise, by eye things look reasonable because there do appear to be distinct expression patterns across clusters (although it is really hard to tell by eye, and some of the cells in different blocks seem like they should be grouped together).  
+  
+  
+## Quantitative sanity check
+  
+So far we have focused on getting the results and trying to determine agreement with expections based on resulting plots.  The results seem mixed so far.  We now want to do what I am calling a quantitative sanity check, where we compare results obtained by different computational methods, or between RNA-Seq and mFISH, or taking prior knowledge into consideration.  Ideally we can build a mapping alorithm that adjusts parameters to try and optimize the results based on priors (or something to this effect), but for now we want to have quick ways of seeing what looks right and what looks wrong to help us make adjustments.  
+  
+First, let's see whether the proportion of cells identified in RNA-seq and mFISH agree.  Note that we would only expect this to be the case when we have unbiased surveyed in both modalities, which is not the case here.  
+  
+```{r type wrap-up, fig.width=8,fig.height=8} 
+countFish9 <- table(fishMouse$mappingResults$Class)
+countFish9 <- countFish9[countFish9>0]
+countSeq  <- table(cl)
+fs <- intersect(names(countFish9),names(countSeq))
+plot(as.numeric(countSeq[fs]),as.numeric(countFish9[fs]),main="Cell types",
+  pch=19,col="grey",ylab="FISH cell count",xlab="RNA-seq cell count",xlim=c(0,max(as.numeric(countSeq[fs]))*1.1))
+text(as.numeric(countSeq[fs]),as.numeric(countFish9[fs]),fs,cex=0.7,srt=0)
+```
+  
+  
+There is not great agreement between modalities.  What if we wrap up by class?
+  
+```{r broad class wrap-up, fig.width=8,fig.height=8} 
+# Second, broad class
+mat <- fishMouse$mappingResults$Class
+broadFish <- annotations$class_label[match(mat,cl)]
+countFish <- table(broadFish)
+countSeq  <- table(anno$class_label)
+fs <- intersect(names(countFish),names(countSeq))
+plot(as.numeric(countSeq[fs]),as.numeric(countFish[fs]),main="Broad classes",
+  pch=19,col="grey",ylab="FISH cell count",xlab="RNA-seq cell count",
+  xlim=c(0,max(as.numeric(countSeq[fs]))*1.1),ylim=c(0,max(as.numeric(countFish[fs]))*1.1))
+text(as.numeric(countSeq[fs]),as.numeric(countFish[fs]),fs,cex=0.7,srt=0)
+```  
+  
+Wrapping up by class, there is somewhat better agreement between proportions across modalities, although there are still some anomolies, likely due to the above issues in clas calling.  
+  
+One possibility (that I think is likely the case for at least a subset of cells) is that there is some mapping issues.  We can try and understand why cells are mapping specific ways by plotting expression levels between RNA-seq and mFISH for each cell type.  Let's do that.  
+  
+```{r mean expression comparison, fig.width=15,fig.height=9} 
+meanFish    <- summarizeMatrix(fishMouse$scaleDat,fishMouse$mappingResults$Class,summaryFunction = mean)[useGenes,]
+meanFish    <- meanFish[,intersect(colnames(meanFish),colnames(medianExpr))]
+medSeq      <- medianExprMax[useGenes,colnames(meanFish)] #meanExpr
+corFS       <- NULL
+par(mfrow=c(3,5))
+for (ct in intersect(allClusts,colnames(medSeq))){
+  corMR <- signif(cor(medSeq[,ct],meanFish[,ct]),3)
+  plot(medSeq[,ct],meanFish[,ct],xlab="RNA-seq",ylab=ct,pch=19,col="white", main=paste("R =",corMR))
+  text(medSeq[,ct],meanFish[,ct],rownames(medSeq),cex=0.9)
+  corFS <- c(corFS,cor(medSeq[,ct],meanFish[,ct]))
+}
+names(corFS) <- intersect(allClusts,colnames(medSeq))
+```  
+  
+Overall, there is quite good agreement for most, but not all, of these cell types.  Similarly, this type of plot can give us a sense of which cell types we can be confident in and which ones we can't, although the exact relationship between confidence of mapping and mapping accuracy remains TBD.  
+  
+  
+Now make a TSNE plot on all genes using the mFISH data.  Do the data cluster by color, and show the points also corresponding to cluster (abbreviated).  
+  
+```{r Plot mFISH TSNE (scaled), fig.width=10,fig.height=8} 
+cap=25
+fishPlot <- fishMouse 
+fishPlot$mappingResults$Broad <- broadFish
+fishPlot <- filterCells(fishPlot,fishPlot$mappingResults$Class!="none")
+p=plotTsne(fishPlot,main="Mouse cells (scaled)",colorGroup="Broad",labelGroup = "Broad",
+           capValue=cap, useScaled=TRUE, perplexity = 10, maxNchar=5)
+p
+```
+  
+Overall it seems that most cells map reasonably well by broad class calls, although it looks like there are a few errors.  
+  
+Repeat, but with the unscaled data.  
+
+```{r Plot mFISH TSNE (unscaled), fig.width=10,fig.height=8} 
+cap=25
+p=plotTsne(fishPlot,main="Mouse cells (unscaled)",colorGroup="Broad",labelGroup = "Broad",
+           capValue=cap, useScaled=FALSE, perplexity = 10, maxNchar=5)
+p
+```
+  
+The unscaled data looks significantly better, suggesting that my scaling strategy isn't great.  
+  
+Repeat but with the points corresponding to layer.  NOTE: This section isn't run because we don't have layer information.  
+  
+```{r Plot mFISH TSNE (scaled, color by layer), fig.width=10,fig.height=6, eval=FALSE} 
+p=plotTsne(fishPlot,main="Mouse Sst cells (scaled)",colorGroup="Class",labelGroup = "layerData",
+           capValue=cap, useScaled=TRUE, perplexity = 10)
+p
+```
+
+The layer and cell type appear to provide some complementary information.  
+  
+  
+### Filter out low-correlation cells.
+  
+We know that there are several cells in here that are either debris or doublets, and likely others with some bad data.  Currently we use correlation, so let's set a correlation threshold and see how some of the plots look after we clean up the results.  This is very much a work in progress.  
+  
+Finally, let's exclude cells with low mapping correlation.  Maybe this will clean up some of the weird results.  
+  
+```{r set correlation threshold} 
+kp <- fishMouse$mappingResults$Correlation>=0.75
+print(paste0("Retaining ",round(100*mean(kp)),"% of the cells."))
+```  
+  
+  
+Let's omit 25% of the data or so.  Let's plot the resulting cell locations.  
+  
+```{r plot filtered cell locations, fig.width=8, fig.height=8}  
+plot(fishMouse$scaledX[kp],-fishMouse$scaledY[kp],pch=19,xlab="x (rotated, mm)",ylab="y (rotated, mm)",
+    col=fishMouse$mappingResults$Class_color[kp],main="Mouse VISp (AI), filtered")  # Note the -y 
+```  
+  
+  
+```{r Plot mFISH heatmap (scaled and high correlation), fig.width=12,fig.height=8} 
+sample_fire_plot(fish_df[kp,], 
+                 fish_anno[kp,], 
+                 genes = rownames(fishDat), 
+                 grouping = "Class", 
+                 group_order = sort(unique(fish_anno$Class_id[kp])),
+                 log_scale = FALSE,
+                 font_size = 7)
+```  
+  
+  
+Now show the TSNE on the unscaled and filtered data.   
+
+```{r Plot mFISH TSNE (unscaled and filtered), fig.width=10,fig.height=8} 
+cap=25
+p=plotTsne(filterCells(fishPlot,kp),main="Mouse cells (unscaled)",colorGroup="Broad",labelGroup = "Broad",
+           capValue=cap, useScaled=FALSE, perplexity = 10, maxNchar=5)
+p
+```
+  
+This looks significantly cleaner than above!  It also suggests that a clustering prior to mapping **might** make sense, as some of these clusters include cells from multiple mapped subclasses.  
+  
+  
+### Output results
+  
+Finally, output the cluster calls and confidence scores to a new file.  
+  
+```{r output results} 
+out <- fishMouse$mappingResults
+cn  <- c("sample_name","Class_label","Class_id","Class_color","Correlation","DifferenceBetweenTopTwoCorrelations")
+cn  <- c(cn,setdiff(colnames(out),c(cn,"Class")))
+write.csv(out[,cn],paste0(prefix,"_mappingResults.csv"), row.names=FALSE)
+```  
+  
+  
+  
+**It is important to note that these tools are very much in development and minimally tested, but even so we hope that that are useful.**  
+
+```{r sessionInfo}
+sessionInfo()
+```
+  
+```{r my notes, echo=FALSE}
+# Here are things I need to do fix in mfishtools
+#1) Error in plotDistributions.  The color map always plots the first color, even if layer 1 information is missing.  This function also needs to be updated to be more flexible with the color options.
+
+#2) The rotateXY function screws up if it is run more than once on the same data set
+
+#3) Check scaling of Cux2 data (and other genes!)
+
+#4) Allow scaling of RNA-seq to spatial transcriptomics instead, OR setting the max value to 1 for all.
+
+#5) Need to update buildTreeFromGenePanel to return an error if cluster names in clusters and in dendrogram do not match.
+
+#6) Need to make a new function (or new functionality) to optimize buildTreeFromGenePanel for a specific number of genes expressed in each cell type to avoid gene panels where certain clusters are marker with only one or two genes.
+```  
